@@ -26,7 +26,6 @@ import {
 import { getShopListLinesFromUserInput, isLikelyMealLine, isLikelyUiPlaceholderList } from './lib/parseShopList'
 import {
   classifyMealInput,
-  coerceToSingleMealInput,
   inferMealTitleFromIngredients,
   type ClassifiedMealInput,
 } from './lib/mealInputClassification'
@@ -498,6 +497,18 @@ type RemoveConfirmTarget =
   | { kind: 'meal'; mealId: string; name: string }
   | { kind: 'essential'; id: string; name: string }
   | { kind: 'folder'; id: string; name: string }
+
+type FolderTransferState = {
+  mode: 'move' | 'copy'
+  mealId: string
+  mealTitle: string
+  selectedFolderId: string | null
+}
+
+type MealRenameState = {
+  mealId: string
+  title: string
+}
 
 function folderMealCount(list: SavedList): number {
   return list.mealGroups.filter((m) => !m.removed).length
@@ -1514,16 +1525,24 @@ function normKey(value: string): string {
     .trim()
 }
 
+/**
+ * Merge newly built meals into the folder.
+ * Preserves existing order and appends brand-new titles so a multi-meal
+ * Create never overwrites earlier results with the last meal only.
+ */
 function mergeMealGroups(existing: MealGroup[], incoming: MealGroup[]): MealGroup[] {
   if (incoming.length === 0) return existing
-  const byTitle = new Map(existing.map((meal) => [normKey(meal.title), meal]))
+  const result = existing.map((meal) => ({ ...meal }))
+  const indexByTitle = new Map(result.map((meal, index) => [normKey(meal.title), index]))
   for (const next of incoming) {
     const key = normKey(next.title)
-    const prev = byTitle.get(key)
-    if (!prev) {
-      byTitle.set(key, next)
+    const idx = indexByTitle.get(key)
+    if (idx === undefined) {
+      indexByTitle.set(key, result.length)
+      result.push(next)
       continue
     }
+    const prev = result[idx]
     const ingredientMap = new Map(prev.ingredients.map((i) => [normKey(i.name), i]))
     for (const ing of next.ingredients) {
       const ingKey = normKey(ing.name)
@@ -1534,14 +1553,29 @@ function mergeMealGroups(existing: MealGroup[], incoming: MealGroup[]): MealGrou
         ingredientMap.set(ingKey, ing)
       }
     }
-    byTitle.set(key, {
+    result[idx] = {
       ...prev,
       chipLabel: prev.chipLabel ?? next.chipLabel,
       methodUrl: prev.methodUrl ?? next.methodUrl,
       ingredients: Array.from(ingredientMap.values()),
-    })
+    }
   }
-  return Array.from(byTitle.values())
+  return result
+}
+
+/** Deep-clone a meal with brand-new IDs so copies are independently editable. */
+function cloneMealGroup(meal: MealGroup): MealGroup {
+  return {
+    ...meal,
+    id: crypto.randomUUID(),
+    removed: false,
+    expanded: false,
+    ingredients: meal.ingredients.map((ingredient) => ({
+      ...ingredient,
+      id: crypto.randomUUID(),
+    })),
+    tags: meal.tags ? [...meal.tags] : meal.tags,
+  }
 }
 
 function getCatalogErrorMessage(error: unknown): string {
@@ -1758,6 +1792,10 @@ function App() {
   const composerKeyboardScrollCleanupRef = useRef<(() => void) | null>(null)
   const [cuisineSelection] = useState<'All' | Cuisine>('All')
   const [removeConfirmTarget, setRemoveConfirmTarget] = useState<RemoveConfirmTarget | null>(null)
+  const [mealMenuOpenId, setMealMenuOpenId] = useState<string | null>(null)
+  const [folderTransfer, setFolderTransfer] = useState<FolderTransferState | null>(null)
+  const [mealRename, setMealRename] = useState<MealRenameState | null>(null)
+  const [creatingMealCount, setCreatingMealCount] = useState(0)
   const [showResetConfirm, setShowResetConfirm] = useState(false)
   const [chipSnackbarVisible, setChipSnackbarVisible] = useState(false)
   const [removedEssentialName, setRemovedEssentialName] = useState('')
@@ -2006,6 +2044,56 @@ function App() {
   }, [removeConfirmTarget])
 
   useEffect(() => {
+    if (!folderTransfer) return
+    const prevOverflow = document.body.style.overflow
+    document.body.style.overflow = 'hidden'
+    const onKeyDown = (event: globalThis.KeyboardEvent) => {
+      if (event.key === 'Escape') setFolderTransfer(null)
+    }
+    document.addEventListener('keydown', onKeyDown)
+    return () => {
+      document.body.style.overflow = prevOverflow
+      document.removeEventListener('keydown', onKeyDown)
+    }
+  }, [folderTransfer])
+
+  useEffect(() => {
+    if (!mealRename) return
+    const prevOverflow = document.body.style.overflow
+    document.body.style.overflow = 'hidden'
+    const onKeyDown = (event: globalThis.KeyboardEvent) => {
+      if (event.key === 'Escape') setMealRename(null)
+    }
+    document.addEventListener('keydown', onKeyDown)
+    return () => {
+      document.body.style.overflow = prevOverflow
+      document.removeEventListener('keydown', onKeyDown)
+    }
+  }, [mealRename])
+
+  useEffect(() => {
+    if (!mealMenuOpenId) return
+    const onPointerDown = (event: PointerEvent) => {
+      const target = event.target
+      if (!(target instanceof Element)) {
+        setMealMenuOpenId(null)
+        return
+      }
+      if (target.closest('[role="menu"]') || target.closest('[aria-haspopup="menu"]')) return
+      setMealMenuOpenId(null)
+    }
+    const onKeyDown = (event: globalThis.KeyboardEvent) => {
+      if (event.key === 'Escape') setMealMenuOpenId(null)
+    }
+    document.addEventListener('pointerdown', onPointerDown)
+    document.addEventListener('keydown', onKeyDown)
+    return () => {
+      document.removeEventListener('pointerdown', onPointerDown)
+      document.removeEventListener('keydown', onKeyDown)
+    }
+  }, [mealMenuOpenId])
+
+  useEffect(() => {
     if (!toast) return
     const timeout = window.setTimeout(() => setToast(''), 2200)
     return () => window.clearTimeout(timeout)
@@ -2238,10 +2326,11 @@ function App() {
         }
       }
 
-      // Shop Single Meal: one Create meal action never produces more than one meal.
+      // Keep all independently built meals from this Create meal action.
+      // Ingredient lists still produce a single wrapped meal above.
       built = {
         ...built,
-        meals: built.meals.slice(0, 1).map((m) => ({ ...m, expanded: true })),
+        meals: built.meals.map((m) => ({ ...m, expanded: false })),
       }
 
       if (!builtShopHasRows(built)) {
@@ -2314,12 +2403,13 @@ function App() {
     const rawLooksNonEmpty =
       rawFromDom.replace(/[\u200B-\u200D\uFEFF\u00AD\u200E\u200F\u202A-\u202E\u2060]/g, '').trim().length > 0
 
-    const classified = coerceToSingleMealInput(classifyMealInput(rawFromDom))
+    const classified = classifyMealInput(rawFromDom)
     if (classified.kind === 'unclear' || classified.lines.length === 0) {
       listBuildGenerationRef.current += 1
       setCatalogLoading(false)
       chipSourceLinesRef.current = []
       resultsFromChipRef.current = false
+      setCreatingMealCount(0)
       if (rawLooksNonEmpty && isLikelyUiPlaceholderList(rawFromDom)) {
         setInputValue('')
         setListInputError(
@@ -2333,7 +2423,11 @@ function App() {
       return
     }
 
+    setCreatingMealCount(
+      classified.kind === 'multiple_meals' ? classified.lines.length : classified.kind === 'single_meal' ? 1 : 1,
+    )
     await generateMealsFromClassified(classified, { clearInput: true })
+    setCreatingMealCount(0)
   }
 
   function addSuggestionToMeals(tag: string) {
@@ -2342,19 +2436,20 @@ function App() {
     resultsFromChipRef.current = true
     chipSourceLinesRef.current = [tag]
     setActiveInspirationChip(tag)
+    setCreatingMealCount(1)
 
     void (async () => {
       try {
-        const classified = coerceToSingleMealInput(classifyMealInput(tag))
         // Inspiration chips always mean a single meal shortcut
         const forced: ClassifiedMealInput = {
           kind: 'single_meal',
-          lines: classified.lines.length > 0 ? [classified.lines[0]] : [tag],
+          lines: [tag],
         }
         await generateMealsFromClassified(forced, { fromChip: true, clearInput: false })
       } finally {
         resultsFromChipRef.current = false
         setActiveInspirationChip(null)
+        setCreatingMealCount(0)
       }
     })()
   }
@@ -2981,9 +3076,17 @@ function App() {
     if (!removeConfirmTarget) return
     if (removeConfirmTarget.kind === 'meal') {
       const removedMealId = removeConfirmTarget.mealId
-      setMealGroups((prev) =>
-        prev.map((m) => (m.id === removedMealId ? { ...m, removed: true } : m)),
-      )
+      setMealGroups((prev) => {
+        const next = prev.map((m) => (m.id === removedMealId ? { ...m, removed: true } : m))
+        if (activeListId) {
+          setSavedLists((lists) =>
+            lists.map((l) =>
+              l.id === activeListId ? { ...l, mealGroups: next, essentials, generated } : l,
+            ),
+          )
+        }
+        return next
+      })
       // Deleting the meal you're viewing has nowhere to go but the folder.
       if (activeMealId === removedMealId) {
         setActiveMealId(null)
@@ -2997,6 +3100,116 @@ function App() {
     }
     setRemoveConfirmTarget(null)
   }
+
+  function openMealCardMenu(mealId: string) {
+    setMealMenuOpenId((prev) => (prev === mealId ? null : mealId))
+  }
+
+  function startRenameMeal(meal: MealGroup) {
+    setMealMenuOpenId(null)
+    setMealRename({ mealId: meal.id, title: meal.title })
+  }
+
+  function cancelRenameMeal() {
+    setMealRename(null)
+  }
+
+  function commitRenameMeal() {
+    if (!mealRename) return
+    const nextTitle = mealRename.title.replace(/\s+/g, ' ').trim()
+    if (!nextTitle) {
+      cancelRenameMeal()
+      return
+    }
+    const mealId = mealRename.mealId
+    setMealGroups((prev) => {
+      const next = prev.map((m) => (m.id === mealId ? { ...m, title: nextTitle } : m))
+      if (activeListId) {
+        setSavedLists((lists) =>
+          lists.map((l) =>
+            l.id === activeListId ? { ...l, mealGroups: next, essentials, generated } : l,
+          ),
+        )
+      }
+      return next
+    })
+    setMealRename(null)
+  }
+
+  function startFolderTransfer(mode: 'move' | 'copy', meal: MealGroup) {
+    setMealMenuOpenId(null)
+    setFolderTransfer({
+      mode,
+      mealId: meal.id,
+      mealTitle: meal.title,
+      selectedFolderId: null,
+    })
+  }
+
+  function confirmFolderTransfer() {
+    if (!folderTransfer || !folderTransfer.selectedFolderId || !activeListId) return
+    const sourceMeal = mealGroups.find((m) => m.id === folderTransfer.mealId && !m.removed)
+    if (!sourceMeal) {
+      setFolderTransfer(null)
+      return
+    }
+    const destId = folderTransfer.selectedFolderId
+    if (destId === activeListId) {
+      setFolderTransfer(null)
+      return
+    }
+
+    if (folderTransfer.mode === 'move') {
+      const movedMeal = { ...sourceMeal, expanded: false }
+      setMealGroups((prev) => {
+        const nextSource = prev.filter((m) => m.id !== sourceMeal.id)
+        setSavedLists((lists) =>
+          lists.map((l) => {
+            if (l.id === activeListId) {
+              return { ...l, mealGroups: nextSource, essentials, generated }
+            }
+            if (l.id === destId) {
+              const withoutDup = l.mealGroups.filter((m) => m.id !== movedMeal.id)
+              return {
+                ...l,
+                mealGroups: [...withoutDup, movedMeal],
+                generated: true,
+              }
+            }
+            return l
+          }),
+        )
+        return nextSource
+      })
+      if (activeMealId === sourceMeal.id) {
+        setActiveMealId(null)
+        if (appView === 'mealDraft') setAppView('mealList')
+      }
+    } else {
+      const copiedMeal = cloneMealGroup(sourceMeal)
+      setSavedLists((lists) =>
+        lists.map((l) => {
+          if (l.id === activeListId) {
+            return { ...l, mealGroups, essentials, generated }
+          }
+          if (l.id === destId) {
+            return {
+              ...l,
+              mealGroups: [...l.mealGroups, copiedMeal],
+              generated: true,
+            }
+          }
+          return l
+        }),
+      )
+    }
+    setFolderTransfer(null)
+  }
+
+  const otherFoldersForTransfer = useMemo(() => {
+    if (!activeListId) return []
+    return savedLists.filter((list) => list.id !== activeListId)
+  }, [savedLists, activeListId])
 
   function goToIndex() {
     // Auto-save current build state before leaving
@@ -3137,7 +3350,12 @@ function App() {
   const bottomSnackbarBarClass =
     'fixed left-1/2 z-40 -translate-x-1/2 bg-[#1f1f1f] px-5 py-3 text-white shadow-[0px_2px_8px_rgba(0,0,0,0.35)]'
   const suppressStickyHeader =
-    showPreferences || Boolean(swapTarget) || Boolean(removeConfirmTarget) || showResetConfirm
+    showPreferences ||
+    Boolean(swapTarget) ||
+    Boolean(removeConfirmTarget) ||
+    Boolean(folderTransfer) ||
+    Boolean(mealRename) ||
+    showResetConfirm
 
   const addPanelTitle = 'ADD YOUR MEAL'
 
@@ -3611,7 +3829,9 @@ function App() {
                 {imageProcessing
                   ? 'Reading your image…'
                   : catalogLoading
-                    ? 'Creating your meal…'
+                    ? creatingMealCount > 1
+                      ? 'Creating meals…'
+                      : 'Creating your meal…'
                     : 'Create meal'}
               </button>
             </div>
@@ -3667,7 +3887,7 @@ function App() {
                   )
                   return (
                     <article key={meal.id} className="flex flex-col border border-[#ddd] bg-white p-4">
-                      <div className="flex items-start justify-between gap-2">
+                      <div className="relative flex items-start justify-between gap-2">
                         <button
                           type="button"
                           className="min-w-0 flex-1 text-left text-[18px] font-normal leading-6 text-[#333]"
@@ -3676,16 +3896,69 @@ function App() {
                         >
                           {meal.title}
                         </button>
-                        <button
-                          type="button"
-                          aria-label={`More options for ${meal.title}`}
-                          className="-mr-1 -mt-1 shrink-0 p-1 text-[#757575]"
-                          onClick={() =>
-                            setRemoveConfirmTarget({ kind: 'meal', mealId: meal.id, name: meal.title })
-                          }
-                        >
-                          <IconOverflowMenu />
-                        </button>
+                        <div className="relative shrink-0">
+                          <button
+                            type="button"
+                            aria-label={`More options for ${meal.title}`}
+                            aria-haspopup="menu"
+                            aria-expanded={mealMenuOpenId === meal.id}
+                            className="-mr-1 -mt-1 p-1 text-[#757575]"
+                            onClick={(e) => {
+                              e.stopPropagation()
+                              openMealCardMenu(meal.id)
+                            }}
+                          >
+                            <IconOverflowMenu />
+                          </button>
+                          {mealMenuOpenId === meal.id ? (
+                            <div
+                              role="menu"
+                              aria-label={`Actions for ${meal.title}`}
+                              className="absolute right-0 z-20 mt-1 min-w-[220px] border border-[#ddd] bg-white py-1 shadow-[0px_2px_8px_rgba(0,0,0,0.12)]"
+                              onClick={(e) => e.stopPropagation()}
+                            >
+                              <button
+                                type="button"
+                                role="menuitem"
+                                className="block w-full px-4 py-2.5 text-left text-[16px] leading-6 text-[#333] hover:bg-[#f5f5f5]"
+                                onClick={() => startRenameMeal(meal)}
+                              >
+                                Rename meal
+                              </button>
+                              <button
+                                type="button"
+                                role="menuitem"
+                                className="block w-full px-4 py-2.5 text-left text-[16px] leading-6 text-[#333] hover:bg-[#f5f5f5]"
+                                onClick={() => startFolderTransfer('move', meal)}
+                              >
+                                Move to another folder
+                              </button>
+                              <button
+                                type="button"
+                                role="menuitem"
+                                className="block w-full px-4 py-2.5 text-left text-[16px] leading-6 text-[#333] hover:bg-[#f5f5f5]"
+                                onClick={() => startFolderTransfer('copy', meal)}
+                              >
+                                Copy to another folder
+                              </button>
+                              <button
+                                type="button"
+                                role="menuitem"
+                                className="block w-full px-4 py-2.5 text-left text-[16px] leading-6 text-[#333] hover:bg-[#f5f5f5]"
+                                onClick={() => {
+                                  setMealMenuOpenId(null)
+                                  setRemoveConfirmTarget({
+                                    kind: 'meal',
+                                    mealId: meal.id,
+                                    name: meal.title,
+                                  })
+                                }}
+                              >
+                                Remove meal
+                              </button>
+                            </div>
+                          ) : null}
+                        </div>
                       </div>
                       <p className="mt-2 text-[14px] font-light leading-5 text-[#53565A]">
                         {mealItems} item{mealItems === 1 ? '' : 's'} &bull; {formatCurrency(mealPrice)}
@@ -3960,7 +4233,9 @@ function App() {
             <p id="remove-item-dialog-title" className="text-[16px] leading-6 text-[#333]">
               {removeConfirmTarget.kind === 'folder'
                 ? `Delete “${removeConfirmTarget.name}”? This will remove the folder and all meals inside it.`
-                : 'This item will be removed from this list'}
+                : removeConfirmTarget.kind === 'meal'
+                  ? 'This meal will be removed from this folder.'
+                  : 'This item will be removed from this list'}
             </p>
             <div className="mt-6 flex flex-col gap-3 sm:flex-row sm:justify-end">
               <button
@@ -3975,7 +4250,159 @@ function App() {
                 className="bg-[#53565A] px-5 py-2 text-[16px] text-white"
                 onClick={confirmListItemRemoval}
               >
-                {removeConfirmTarget.kind === 'folder' ? 'Delete' : 'Confirm'}
+                {removeConfirmTarget.kind === 'folder'
+                  ? 'Delete'
+                  : removeConfirmTarget.kind === 'meal'
+                    ? 'Remove'
+                    : 'Confirm'}
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {folderTransfer && (
+        <div
+          className="fixed inset-0 z-30 flex items-center justify-center bg-black/30 p-4"
+          onClick={(e) => {
+            if (e.target === e.currentTarget) setFolderTransfer(null)
+          }}
+        >
+          <div
+            role="dialog"
+            aria-modal="true"
+            aria-labelledby="folder-transfer-dialog-title"
+            className="w-full max-w-[544px] bg-white p-6"
+          >
+            <p
+              id="folder-transfer-dialog-title"
+              className="text-[16px] font-normal leading-6 text-[#333]"
+            >
+              {folderTransfer.mode === 'move' ? 'Move meal' : 'Copy meal'}
+            </p>
+            <p className="mt-1 text-[14px] leading-5 text-[#53565A]">{folderTransfer.mealTitle}</p>
+
+            {otherFoldersForTransfer.length === 0 ? (
+              <p className="mt-5 text-[16px] leading-6 text-[#333]">
+                You don&apos;t have another folder yet.
+                <br />
+                Create a folder first to {folderTransfer.mode === 'move' ? 'move' : 'copy'} this meal.
+              </p>
+            ) : (
+              <fieldset className="mt-5">
+                <legend className="mb-3 text-[14px] font-normal uppercase tracking-[2.8px] text-[#53565A]">
+                  Choose folder
+                </legend>
+                <div className="flex flex-col gap-2">
+                  {otherFoldersForTransfer.map((folder) => {
+                    const selected = folderTransfer.selectedFolderId === folder.id
+                    return (
+                      <label
+                        key={folder.id}
+                        className="flex cursor-pointer items-center gap-3 border border-[#ddd] px-4 py-3 text-[16px] leading-6 text-[#333]"
+                      >
+                        <input
+                          type="radio"
+                          name="folder-transfer-destination"
+                          className="size-4 accent-[#53565A]"
+                          checked={selected}
+                          onChange={() =>
+                            setFolderTransfer((prev) =>
+                              prev ? { ...prev, selectedFolderId: folder.id } : prev,
+                            )
+                          }
+                        />
+                        <span>{folder.name}</span>
+                      </label>
+                    )
+                  })}
+                </div>
+              </fieldset>
+            )}
+
+            <div className="mt-6 flex flex-col gap-3 sm:flex-row sm:justify-end">
+              <button
+                type="button"
+                className="border border-[#333] bg-white px-5 py-2 text-[16px] text-[#333]"
+                onClick={() => setFolderTransfer(null)}
+              >
+                Cancel
+              </button>
+              {otherFoldersForTransfer.length > 0 ? (
+                <button
+                  type="button"
+                  className="bg-[#53565A] px-5 py-2 text-[16px] text-white disabled:bg-[#eeeeee] disabled:text-[#a9a9a9]"
+                  disabled={!folderTransfer.selectedFolderId}
+                  onClick={confirmFolderTransfer}
+                >
+                  {folderTransfer.mode === 'move' ? 'Move' : 'Copy'}
+                </button>
+              ) : null}
+            </div>
+          </div>
+        </div>
+      )}
+
+      {mealRename && (
+        <div
+          className="fixed inset-0 z-30 flex items-center justify-center bg-black/30 p-4"
+          onClick={(e) => {
+            if (e.target === e.currentTarget) cancelRenameMeal()
+          }}
+        >
+          <div
+            role="dialog"
+            aria-modal="true"
+            aria-labelledby="rename-meal-dialog-title"
+            className="w-full max-w-[544px] bg-white p-6"
+          >
+            <p
+              id="rename-meal-dialog-title"
+              className="text-[16px] font-normal leading-6 text-[#333]"
+            >
+              Rename meal
+            </p>
+            <label htmlFor="rename-meal-input" className="sr-only">
+              Meal title
+            </label>
+            <input
+              id="rename-meal-input"
+              type="text"
+              autoFocus
+              maxLength={80}
+              value={mealRename.title}
+              onChange={(e) =>
+                setMealRename((prev) => (prev ? { ...prev, title: e.target.value.slice(0, 80) } : prev))
+              }
+              onKeyDown={(e) => {
+                if (e.key === 'Enter') {
+                  e.preventDefault()
+                  commitRenameMeal()
+                } else if (e.key === 'Escape') {
+                  e.preventDefault()
+                  cancelRenameMeal()
+                }
+              }}
+              className="mt-4 w-full border-b border-[#a9a9a9] bg-transparent pb-3 text-[16px] text-[#333] outline-none focus:border-[#154734]"
+              placeholder="Meal title"
+              autoComplete="off"
+            />
+            <div className="mt-1 text-right text-[12px] text-[#53565A]">{mealRename.title.length}/80</div>
+            <div className="mt-6 flex flex-col gap-3 sm:flex-row sm:justify-end">
+              <button
+                type="button"
+                className="border border-[#333] bg-white px-5 py-2 text-[16px] text-[#333]"
+                onClick={cancelRenameMeal}
+              >
+                Cancel
+              </button>
+              <button
+                type="button"
+                className="bg-[#53565A] px-5 py-2 text-[16px] text-white disabled:bg-[#eeeeee] disabled:text-[#a9a9a9]"
+                disabled={!mealRename.title.trim()}
+                onClick={commitRenameMeal}
+              >
+                Save
               </button>
             </div>
           </div>

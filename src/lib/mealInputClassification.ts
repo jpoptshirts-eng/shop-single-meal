@@ -17,6 +17,11 @@ export type ClassifiedMealInput = {
 const DAY_PREFIX =
   /^(monday|tuesday|wednesday|thursday|friday|saturday|sunday|mon|tue|wed|thu|fri|sat|sun)\s*[–—\-:]\s*/iu
 
+const NUMBERED_PREFIX = /^\d+[\.\)]\s+/u
+
+const INTENT_PREAMBLE =
+  /^(i\s+want|i'?d\s+like|i\s+would\s+like|can\s+i\s+(?:have|get)|please\s+(?:make|add|give\s+me)|give\s+me)\s+/iu
+
 const QUANTITY_PREFIX =
   /^(\d+([.,]\d+)?\s*(g|kg|ml|l|oz|lb|tbsp|tsp|cups?|x)?|\d+\s*x\s*)/iu
 
@@ -123,6 +128,14 @@ function stripDayPrefix(line: string): string {
   return stripInvisibleAndTrim(line.replace(DAY_PREFIX, ''))
 }
 
+function stripNumberedPrefix(line: string): string {
+  return stripInvisibleAndTrim(line.replace(NUMBERED_PREFIX, ''))
+}
+
+function stripIntentPreamble(text: string): string {
+  return stripInvisibleAndTrim(text.replace(INTENT_PREAMBLE, ''))
+}
+
 /** Split a single segment on commas / semicolons / " and " without breaking "Salmon & veg". */
 function splitConjunctions(segment: string): string[] {
   const raw = stripInvisibleAndTrim(segment)
@@ -135,22 +148,24 @@ function splitConjunctions(segment: string): string[] {
 
 /**
  * Expand free text into candidate lines for meal / ingredient classification.
- * Supports newlines, commas, semicolons, "and", and day-prefixed meal lists.
+ * Supports newlines, commas, semicolons, "and", numbered lists, day prefixes,
+ * and light natural-language preambles ("I want …").
  */
 export function extractCandidateLines(text: string): string[] {
-  const raw = stripInvisibleAndTrim(text)
+  const raw = stripIntentPreamble(stripInvisibleAndTrim(text))
   if (!raw) return []
 
   const newlineParts = raw
     .split(/\n+/u)
-    .map((line) => stripDayPrefix(line))
+    .map((line) => stripNumberedPrefix(stripDayPrefix(line)))
+    .map((line) => stripIntentPreamble(line))
     .filter(Boolean)
 
   const expanded: string[] = []
   for (const part of newlineParts) {
     const pieces = splitConjunctions(part)
     if (pieces.length > 1) {
-      expanded.push(...pieces)
+      expanded.push(...pieces.map((p) => stripIntentPreamble(p)))
     } else {
       expanded.push(part)
     }
@@ -160,10 +175,12 @@ export function extractCandidateLines(text: string): string[] {
   const seen = new Set<string>()
   const out: string[] = []
   for (const line of expanded) {
-    const key = line.toLowerCase()
+    const cleaned = stripInvisibleAndTrim(line)
+    if (!cleaned) continue
+    const key = cleaned.toLowerCase()
     if (seen.has(key)) continue
     seen.add(key)
-    out.push(line)
+    out.push(cleaned)
   }
   return out
 }
@@ -186,7 +203,7 @@ export function looksLikeIngredientLine(line: string): boolean {
 
   const words = t
     .toLowerCase()
-    .replace(/[^a-z0-9\s]/g, ' ')
+    .replace(/[^a-z0-9\s']/g, ' ')
     .split(/\s+/)
     .filter(Boolean)
 
@@ -209,13 +226,15 @@ export function looksLikeMealLine(line: string): boolean {
 /**
  * Classify free-text (typed, pasted, or OCR) for Shop Single Meal generation.
  *
- * Shop Single Meal always creates exactly ONE meal per Create meal action.
- * Multiple recognised meal titles collapse to the first title only.
+ * The folder-level Create meal action may produce one OR many independent meal cards.
+ * The single-meal detail page still always edits exactly one meal.
  *
  * Priority:
- * 1. one or more recognised meal titles → single meal (first title)
- * 2. ingredient list → one meal built from those ingredients
- * 3. unresolved / unclear
+ * 1. multiple recognised meals
+ * 2. single recognised meal
+ * 3. ingredient list
+ * 4. mixed meal + ingredient input (meal wins; loose groceries ignored)
+ * 5. unresolved / unclear
  */
 export function classifyMealInput(text: string): ClassifiedMealInput {
   const safe = getShopListLinesFromUserInput(text)
@@ -229,45 +248,38 @@ export function classifyMealInput(text: string): ClassifiedMealInput {
   const mealLines = candidates.filter(looksLikeMealLine)
   const ingredientLines = candidates.filter(looksLikeIngredientLine)
 
-  // One or more meal titles → always a single meal (first title wins)
-  if (mealLines.length >= 1) {
-    return { kind: 'single_meal', lines: [mealLines[0]] }
+  // 1) Two or more meal titles → multiple meals (ignore loose ingredients)
+  if (mealLines.length >= 2) {
+    return { kind: 'multiple_meals', lines: mealLines }
   }
 
-  // Single candidate line that is not clearly an ingredient → treat as meal title
+  // 2) Single candidate line
   if (candidates.length === 1) {
-    if (!looksLikeIngredientLine(candidates[0])) {
+    if (looksLikeMealLine(candidates[0]) || !looksLikeIngredientLine(candidates[0])) {
       return { kind: 'single_meal', lines: candidates }
     }
     return { kind: 'ingredient_list', lines: candidates }
   }
 
-  // Ingredient-dominated list with no meal titles → one meal from ingredients
-  if (ingredientLines.length >= 1) {
+  // 3–4) One meal among other lines (mixed list) → that meal only
+  if (mealLines.length === 1) {
+    return { kind: 'single_meal', lines: mealLines }
+  }
+
+  // 5) Ingredient-dominated list with no meal titles
+  if (ingredientLines.length >= 1 && mealLines.length === 0) {
     return { kind: 'ingredient_list', lines: candidates }
   }
 
-  // Multi-line phrase-like text without quantities → first line as one meal
+  // Multi-line phrase-like text without quantities → treat as meal titles
   if (
     candidates.length >= 2 &&
     candidates.every((c) => c.split(/\s+/).filter(Boolean).length >= 2 && !QUANTITY_PREFIX.test(c))
   ) {
-    return { kind: 'single_meal', lines: [candidates[0]] }
+    return { kind: 'multiple_meals', lines: candidates }
   }
 
   return { kind: 'unclear', lines: candidates }
-}
-
-/** Force any classification into a single-meal creation payload. */
-export function coerceToSingleMealInput(classified: ClassifiedMealInput): ClassifiedMealInput {
-  if (classified.kind === 'unclear' || classified.lines.length === 0) {
-    return classified
-  }
-  if (classified.kind === 'ingredient_list') {
-    return classified
-  }
-  // multiple_meals / single_meal → exactly one title
-  return { kind: 'single_meal', lines: [classified.lines[0]] }
 }
 
 /**
