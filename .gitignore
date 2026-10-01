@@ -37,4 +37,5 @@ supabase/.temp/
 .env.local
 .env.production
 .env.*.local
+.env*
 !.env.example
