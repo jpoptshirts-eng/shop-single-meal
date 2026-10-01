@@ -136,6 +136,10 @@ type MealGroup = {
   calories?: string
   tags?: string[]
   preparationTime?: string
+  /** Overall cook time from Add notes. */
+  cookTime?: string
+  /** Free-text tips from Add notes. */
+  tips?: string
   rating?: number
   ratingCount?: number
   servings?: number
@@ -449,7 +453,7 @@ function defaultMealMeta(partial?: Partial<MealGroup>): Pick<
   return {
     calories: partial?.calories ?? '175 Kcal',
     tags: partial?.tags ?? [],
-    preparationTime: partial?.preparationTime ?? '35 mins',
+    preparationTime: partial?.preparationTime ?? '',
     rating: partial?.rating ?? 5,
     ratingCount: partial?.ratingCount ?? 1,
     servings: partial?.servings ?? 4,
@@ -508,6 +512,13 @@ type FolderTransferState = {
 type MealRenameState = {
   mealId: string
   title: string
+}
+
+type MealNotesState = {
+  mealId: string
+  prepTime: string
+  cookTime: string
+  tips: string
 }
 
 function folderMealCount(list: SavedList): number {
@@ -1795,6 +1806,7 @@ function App() {
   const [mealMenuOpenId, setMealMenuOpenId] = useState<string | null>(null)
   const [folderTransfer, setFolderTransfer] = useState<FolderTransferState | null>(null)
   const [mealRename, setMealRename] = useState<MealRenameState | null>(null)
+  const [mealNotes, setMealNotes] = useState<MealNotesState | null>(null)
   const [creatingMealCount, setCreatingMealCount] = useState(0)
   const [showResetConfirm, setShowResetConfirm] = useState(false)
   const [chipSnackbarVisible, setChipSnackbarVisible] = useState(false)
@@ -2070,6 +2082,20 @@ function App() {
       document.removeEventListener('keydown', onKeyDown)
     }
   }, [mealRename])
+
+  useEffect(() => {
+    if (!mealNotes) return
+    const prevOverflow = document.body.style.overflow
+    document.body.style.overflow = 'hidden'
+    const onKeyDown = (event: globalThis.KeyboardEvent) => {
+      if (event.key === 'Escape') setMealNotes(null)
+    }
+    document.addEventListener('keydown', onKeyDown)
+    return () => {
+      document.body.style.overflow = prevOverflow
+      document.removeEventListener('keydown', onKeyDown)
+    }
+  }, [mealNotes])
 
   useEffect(() => {
     if (!mealMenuOpenId) return
@@ -3136,6 +3162,50 @@ function App() {
     setMealRename(null)
   }
 
+  function startMealNotes(meal: MealGroup) {
+    const legacyDefaultPrep =
+      meal.preparationTime === '35 mins' && !meal.cookTime?.trim() && !meal.tips?.trim()
+    setMealNotes({
+      mealId: meal.id,
+      prepTime: legacyDefaultPrep ? '' : (meal.preparationTime ?? ''),
+      cookTime: meal.cookTime ?? '',
+      tips: meal.tips ?? '',
+    })
+  }
+
+  function cancelMealNotes() {
+    setMealNotes(null)
+  }
+
+  function commitMealNotes() {
+    if (!mealNotes) return
+    const mealId = mealNotes.mealId
+    const prepTime = mealNotes.prepTime.replace(/\s+/g, ' ').trim()
+    const cookTime = mealNotes.cookTime.replace(/\s+/g, ' ').trim()
+    const tips = mealNotes.tips.trim()
+    setMealGroups((prev) => {
+      const next = prev.map((m) =>
+        m.id === mealId
+          ? {
+              ...m,
+              preparationTime: prepTime,
+              cookTime,
+              tips,
+            }
+          : m,
+      )
+      if (activeListId) {
+        setSavedLists((lists) =>
+          lists.map((l) =>
+            l.id === activeListId ? { ...l, mealGroups: next, essentials, generated } : l,
+          ),
+        )
+      }
+      return next
+    })
+    setMealNotes(null)
+  }
+
   function startFolderTransfer(mode: 'move' | 'copy', meal: MealGroup) {
     setMealMenuOpenId(null)
     setFolderTransfer({
@@ -3355,6 +3425,7 @@ function App() {
     Boolean(removeConfirmTarget) ||
     Boolean(folderTransfer) ||
     Boolean(mealRename) ||
+    Boolean(mealNotes) ||
     showResetConfirm
 
   const addPanelTitle = 'ADD YOUR MEAL'
@@ -4011,18 +4082,8 @@ function App() {
                 </div>
               </div>
 
-              <div className="mb-6 flex items-center justify-center gap-2 text-[14px] font-normal uppercase tracking-[2.8px] text-[#53565A]">
-                <span>{listName || 'Untitled folder'}</span>
-                <button
-                  type="button"
-                  aria-label={`More options for ${meal.title}`}
-                  className="p-1 text-[#757575]"
-                  onClick={() =>
-                    setRemoveConfirmTarget({ kind: 'meal', mealId: meal.id, name: meal.title })
-                  }
-                >
-                  <IconOverflowMenu />
-                </button>
+              <div className="mb-6 text-center text-[14px] font-normal uppercase tracking-[2.8px] text-[#53565A]">
+                {listName || 'Untitled folder'}
               </div>
 
               <div className="mx-auto w-full max-w-[1195px]">
@@ -4032,11 +4093,37 @@ function App() {
                     {formatCurrency(mealPrice)}
                   </span>
                   <span aria-hidden="true">&bull;</span>
-                  <span className="inline-flex items-center gap-1 text-[#333] underline">
+                  <button
+                    type="button"
+                    className="inline-flex items-center gap-1 text-[#333] underline"
+                    onClick={() => startMealNotes(meal)}
+                  >
                     <IconPen />
-                    Add notes
-                  </span>
+                    {(() => {
+                      const hasUserNotes =
+                        Boolean(meal.cookTime?.trim() || meal.tips?.trim()) ||
+                        Boolean(meal.preparationTime?.trim() && meal.preparationTime !== '35 mins')
+                      return hasUserNotes ? 'Edit notes' : 'Add notes'
+                    })()}
+                  </button>
                 </div>
+                {(() => {
+                  const prep =
+                    meal.preparationTime?.trim() && meal.preparationTime !== '35 mins'
+                      ? meal.preparationTime.trim()
+                      : ''
+                  const cook = meal.cookTime?.trim() || ''
+                  const tips = meal.tips?.trim() || ''
+                  if (!prep && !cook && !tips) return null
+                  return (
+                    <div className="mb-3 text-[14px] leading-5 text-[#53565A]">
+                      {prep ? <span>Prep {prep}</span> : null}
+                      {prep && cook ? <span aria-hidden="true"> &bull; </span> : null}
+                      {cook ? <span>Cook {cook}</span> : null}
+                      {tips ? <p className="mt-1 text-[14px] leading-5 text-[#333]">{tips}</p> : null}
+                    </div>
+                  )
+                })()}
 
                 <div className="border border-[#ddd] bg-white">
                   {totalCount > 0 && (
@@ -4401,6 +4488,114 @@ function App() {
                 className="bg-[#53565A] px-5 py-2 text-[16px] text-white disabled:bg-[#eeeeee] disabled:text-[#a9a9a9]"
                 disabled={!mealRename.title.trim()}
                 onClick={commitRenameMeal}
+              >
+                Save
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {mealNotes && (
+        <div
+          className="fixed inset-0 z-30 flex items-center justify-center bg-black/30 p-4"
+          onClick={(e) => {
+            if (e.target === e.currentTarget) cancelMealNotes()
+          }}
+        >
+          <div
+            role="dialog"
+            aria-modal="true"
+            aria-labelledby="meal-notes-dialog-title"
+            className="w-full max-w-[544px] bg-white p-6"
+          >
+            <p
+              id="meal-notes-dialog-title"
+              className="text-[16px] font-normal leading-6 text-[#333]"
+            >
+              Add notes
+            </p>
+            <div className="mt-5 flex flex-col gap-4">
+              <div>
+                <label
+                  htmlFor="meal-prep-time"
+                  className="mb-2 block text-[14px] font-normal uppercase tracking-[2.8px] text-[#53565A]"
+                >
+                  Prep time
+                </label>
+                <input
+                  id="meal-prep-time"
+                  type="text"
+                  autoFocus
+                  maxLength={40}
+                  value={mealNotes.prepTime}
+                  onChange={(e) =>
+                    setMealNotes((prev) =>
+                      prev ? { ...prev, prepTime: e.target.value.slice(0, 40) } : prev,
+                    )
+                  }
+                  className="w-full border border-[#a9a9a9] bg-[#fafafa] px-3 py-2.5 text-[16px] leading-6 text-[#333] outline-none placeholder:text-[#53565A] focus:outline focus:outline-2 focus:outline-[#154734]"
+                  placeholder="e.g. 15 mins"
+                  autoComplete="off"
+                />
+              </div>
+              <div>
+                <label
+                  htmlFor="meal-cook-time"
+                  className="mb-2 block text-[14px] font-normal uppercase tracking-[2.8px] text-[#53565A]"
+                >
+                  Cook time
+                </label>
+                <input
+                  id="meal-cook-time"
+                  type="text"
+                  maxLength={40}
+                  value={mealNotes.cookTime}
+                  onChange={(e) =>
+                    setMealNotes((prev) =>
+                      prev ? { ...prev, cookTime: e.target.value.slice(0, 40) } : prev,
+                    )
+                  }
+                  className="w-full border border-[#a9a9a9] bg-[#fafafa] px-3 py-2.5 text-[16px] leading-6 text-[#333] outline-none placeholder:text-[#53565A] focus:outline focus:outline-2 focus:outline-[#154734]"
+                  placeholder="e.g. 45 mins"
+                  autoComplete="off"
+                />
+              </div>
+              <div>
+                <label
+                  htmlFor="meal-tips"
+                  className="mb-2 block text-[14px] font-normal uppercase tracking-[2.8px] text-[#53565A]"
+                >
+                  Tips
+                </label>
+                <textarea
+                  id="meal-tips"
+                  rows={4}
+                  maxLength={500}
+                  value={mealNotes.tips}
+                  onChange={(e) =>
+                    setMealNotes((prev) =>
+                      prev ? { ...prev, tips: e.target.value.slice(0, 500) } : prev,
+                    )
+                  }
+                  className="w-full resize-y border border-[#a9a9a9] bg-[#fafafa] px-3 py-2.5 text-[16px] leading-6 text-[#333] outline-none placeholder:text-[#53565A] focus:outline focus:outline-2 focus:outline-[#154734]"
+                  placeholder="Add any tips for this meal"
+                />
+                <div className="mt-1 text-right text-[12px] text-[#53565A]">{mealNotes.tips.length}/500</div>
+              </div>
+            </div>
+            <div className="mt-6 flex flex-col gap-3 sm:flex-row sm:justify-end">
+              <button
+                type="button"
+                className="border border-[#333] bg-white px-5 py-2 text-[16px] text-[#333]"
+                onClick={cancelMealNotes}
+              >
+                Cancel
+              </button>
+              <button
+                type="button"
+                className="bg-[#53565A] px-5 py-2 text-[16px] text-white"
+                onClick={commitMealNotes}
               >
                 Save
               </button>
